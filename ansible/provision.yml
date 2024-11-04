@@ -1,0 +1,138 @@
+---
+# TODO:
+# - PKG repo
+# - Ensure cronjob survives reboot
+
+- hosts: all
+  become: yes
+
+  tasks:
+  - name: load variables
+    include_vars: "/tmp/config.json"
+
+  - name: Installs common packages
+    pkgng: name="{{item}}" state='present'
+    with_items:
+      - 'rclone'
+      - 'neovim'
+      - 'tmux'
+      - 'wget'
+      - 'curl'
+      - 'zsh'
+      - 'rsync'
+      - 'samba48'
+      - 'smartmontools'
+
+  - name: Configure rc.conf
+    lineinfile: dest="/etc/rc.conf" regexp="^{{item.name}}=" line="{{item.name}}=\"{{item.value}}\""
+    with_items:
+      - { name: 'hostname', value: '{{hostname}}' }
+      - { name: 'keymap', value: 'german.iso.acc.kbd' }
+      - { name: 'ifconfig_ix0', value: 'DHCP' }
+      - { name: 'ifconfig_ix1', value: 'DHCP' }
+      - { name: 'ifconfig_ix2', value: 'DHCP' }
+      - { name: 'ifconfig_ix3', value: 'DHCP' }
+      - { name: 'sshd_enable', value: 'YES' }
+      - { name: 'syslogd_enable', value: 'YES' }
+      - { name: 'syslogd_flags', value: '-s' }
+      - { name: 'ntpd_enable', value: 'YES' }
+      - { name: 'zfs_enable', value: 'YES' }
+      - { name: 'samba_server_enable', value: 'YES' }
+      - { name: 'pf_enable', value: 'YES' }
+      - { name: 'pflog_enable', value: 'YES' }
+
+  - name: Configure loader.conf, configure serial console
+    lineinfile: dest="/boot/loader.conf" regexp="^{{item.name}}=" line="{{item.name}}=\"{{item.value}}\""
+    with_items:
+      - { name: 'aio_load', value: 'YES' }
+      - { name: 'ahci_load', value: 'YES' }
+
+  - name: Configure periodic.conf
+    lineinfile: dest="/etc/periodic.conf" regexp="^{{item.name}}=" line="{{item.name}}=\"{{item.value}}\"" create="yes"
+    with_items:
+      - { name: 'weekly_locate_enable', value: 'NO' }
+      - { name: 'daily_scrub_zfs_enable', value: 'NO' }
+      - { name: 'daily_scrub_zfs_default_threshold', value: '60' }
+
+  - name: Setup user yann
+    user: name='yann' state='present' groups='wheel' shell='/usr/local/bin/zsh'
+
+  - name: Allow passwordless sudo
+    lineinfile: "dest=/usr/local/etc/sudoers state=present regexp='^%wheel' line='%wheel ALL=(ALL) NOPASSWD: ALL'"
+
+  - name: Adds SSH authorized key for yann
+    authorized_key: user='yann' key="{{item}}"
+    with_file:
+      - "{{files_folder}}/authorized_keys"
+
+  - name: Copies login.conf, enabling utf8
+    copy: src="{{files_folder}}/login.conf" dest='/etc/login.conf'
+
+  - name: Sets timezone to Europe/Berlin
+    file: state='link' src='/usr/share/zoneinfo/Europe/Berlin' path='/etc/localtime' force=yes
+
+  - name: Sets DNS server, as it wont be able to write /etc/resolv.conf
+    template: src="{{files_folder}}/resolv.conf.j2" dest='/etc/resolv.conf'
+
+  - name: Add hostname as alias to localhost
+    lineinfile: "dest='/etc/hosts' regexp='127\\.0\\.0\\.1' line='127.0.0.1 localhost {{hostname}}'"
+
+  - name: Add Router IP to known hosts
+    lineinfile: dest='/etc/hosts' regexp='tor' line="192.168.1.1    tor"
+
+  - name: Send syslog to Router
+    lineinfile: dest='/etc/syslog.conf' regexp='@tor' line="*.*      @tor"
+
+  - name: Do not send messages to console
+    lineinfile: dest='/etc/syslog.conf' regexp='\/dev\/console' state='absent'
+
+  - name: Copy sshd config
+    copy: src="{{files_folder}}/sshd_config" dest='/etc/ssh/sshd_config'
+
+  - name: Create zshrc for yann
+    copy: src="{{files_folder}}/zshrc" dest='/home/yann/.zshrc' owner='yann' group='yann' mode='0644'
+
+  - name: Configures /, should be read-only
+    mount: name='/' src='/dev/da0p3' fstype='ufs' opts='ro' state='present' dump='1' passno='1'
+
+  - name: Configure swap
+    lineinfile: dest='/etc/fstab' regexp='swap' line='/dev/da0p2 none swap sw 0 0'
+
+  - name: Configure /tmp
+    mount: name='/tmp' src='md' fstype='mfs' opts='-s=64M,rw' state='present'
+
+  - name: Create the folder for rclone configuration
+    file: path='/mnt/rclone_cache' state='directory' owner='root' group='wheel' mode='0777'
+
+  - name: Mount a small partition from the SSD cache for rclone to use
+    mount: name='/mnt/rclone_cache' src='/dev/da0p1' fstype='ufs' opts='noexec,nosuid' state='present'
+
+  - name: Configure /var
+    mount: name='/var' src='md' fstype='mfs' opts='-s=512M,rw' state='present'
+
+  - name: Install rc file to create directories for samba in /var
+    copy: src="{{files_folder}}/var_samba_dirs" dest='/usr/local/etc/rc.d/var_samba_dirs' mode='0555'
+
+  - name: Create diskless file
+    copy: content='' dest='/etc/diskless' owner='root' group='wheel' mode='0644'
+
+  - name: Create the mountpoint for the ZFS pool
+    file: path='/pool' state='directory' owner='root' group='wheel' mode='0755'
+
+  - name: Copy smb4.conf
+    copy: src="{{files_folder}}/smb4.conf" dest='/usr/local/etc/smb4.conf'
+
+  - name: Copy firewall conf
+    copy: src="{{files_folder}}/pf.conf" dest='/etc/pf.conf' owner='root' group='wheel' mode='0644'
+
+  - name: Copy disks spindown script
+    copy: src="{{files_folder}}/pool_spindown.sh" dest='/usr/local/bin/pool_spindown.sh' owner='root' group='wheel' mode='0755'
+
+    # - name: Create cronjob for the spindown job
+    # - cron: name="spindown" minute="*/10" job="/usr/local/bin/pool_spindown.sh >/dev/null"
+
+  - name: Create the folder for rclone configuration
+    file: path='/etc/rclone' state='directory' owner='root' group='wheel' mode='0755'
+
+  - name: Configure rclone for encrypted BackBlaze B2 backups
+    template: src="{{files_folder}}/rclone.conf.j2" dest='/etc/rclone/rclone.conf' owner='root' group='wheel' mode='0440'
